@@ -10,7 +10,7 @@ from xml.sax.saxutils import escape
 from fastapi import FastAPI, Form, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from . import db, geocode, push, security
+from . import db, geocode, push, security, sms
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("squillami")
@@ -203,10 +203,24 @@ async def twilio_gather(request: Request,
                                          device["platform"] or "android", event_id)
         conn.execute("UPDATE events SET status=? WHERE id=?",
                      ("ringing" if sent else "failed", event_id))
+        # Ultima posizione nota per l'SMS immediato
+        last_loc = conn.execute(
+            "SELECT * FROM locations WHERE user_id=? ORDER BY id DESC LIMIT 1",
+            (user["id"],)).fetchone()
+
+    # Invia subito un SMS con l'ultima posizione rilevata (se disponibile)
+    if last_loc and From:
+        address = geocode.reverse(last_loc["lat"], last_loc["lon"]) or \
+            f"lat {last_loc['lat']:.5f}, lon {last_loc['lon']:.5f}"
+        maps_url = f"https://maps.google.com/?q={last_loc['lat']},{last_loc['lon']}"
+        sms.send_location(From, address, maps_url, last_loc["created_at"])
+        sms_note = "Ti ho inviato un SMS con l'ultima posizione del telefono. "
+    else:
+        sms_note = "Non ho ancora una posizione registrata per questo telefono. "
 
     return twiml(
-        say("Codice corretto. Sto facendo squillare il tuo telefono. "
-            "Resta in linea per conoscere la posizione.") +
+        say("Codice corretto. Sto facendo squillare il tuo telefono. " + sms_note +
+            "Resta in linea per conoscere la posizione aggiornata.") +
         f'<Redirect method="POST">/twilio/status?event_id={event_id}&amp;try=1</Redirect>')
 
 
