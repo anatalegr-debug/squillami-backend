@@ -9,7 +9,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT,
-    code_lookup TEXT UNIQUE NOT NULL,      -- HMAC deterministico del codice (per trovare l'utente dal DTMF)
+    phone_lookup TEXT UNIQUE NOT NULL,     -- HMAC del numero: IDENTIFICA l'utente (univoco)
+    code_hash TEXT NOT NULL,               -- HMAC del codice: VERIFICA (libero, non univoco)
     api_token_hash TEXT NOT NULL,          -- hash del token usato dall'app
     failed_attempts INTEGER DEFAULT 0,
     locked_until TEXT,                     -- ISO datetime; account bloccato fino a

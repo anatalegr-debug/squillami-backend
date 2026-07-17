@@ -1,4 +1,4 @@
-"""Squillami — backend MVP.
+"""MiChiami — backend MVP.
 
 Avvio locale:   uvicorn app.main:app --reload
 Documentazione: http://localhost:8000/docs
@@ -15,7 +15,7 @@ from . import db, geocode, push, security, sms
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("squillami")
 
-app = FastAPI(title="Squillami", version="0.1.0")
+app = FastAPI(title="MiChiami", version="0.1.0")
 
 
 @app.on_event("startup")
@@ -45,8 +45,15 @@ def say(text: str) -> str:
     return f'<Say language="it-IT">{escape(text)}</Say>'
 
 
-def gather_code(prompt: str) -> str:
-    return (f'<Gather input="dtmf" numDigits="6" timeout="10" action="/twilio/gather" method="POST">'
+def gather_phone(prompt: str) -> str:
+    # Il numero ha lunghezza variabile: si conclude con il tasto cancelletto (#)
+    return (f'<Gather input="dtmf" finishOnKey="#" timeout="12" action="/twilio/identify" method="POST">'
+            f"{say(prompt)}</Gather>" + say("Non ho ricevuto nessun numero. Arrivederci."))
+
+
+def gather_code(prompt: str, uid: int) -> str:
+    return (f'<Gather input="dtmf" numDigits="10" finishOnKey="#" timeout="10" '
+            f'action="/twilio/gather?uid={uid}" method="POST">'
             f"{say(prompt)}</Gather>" + say("Non ho ricevuto nessun codice. Arrivederci."))
 
 
@@ -72,22 +79,26 @@ def check_twilio_signature(request: Request, form: dict) -> None:
 # --------------------------------------------------------------------------
 class RegisterIn(BaseModel):
     name: str = Field(default="", max_length=100)
-    code: str = Field(min_length=6, max_length=10)
+    phone: str = Field(min_length=6, max_length=20)
+    code: str = Field(min_length=4, max_length=10)
 
 
 @app.post("/v1/register")
 def register(body: RegisterIn):
-    """Crea l'account. Il codice deve essere di 6-10 cifre e unico nel sistema."""
+    """Crea l'account. Il NUMERO identifica (univoco), il CODICE è libero (4-10 cifre)."""
+    if not security.valid_phone_format(body.phone):
+        raise HTTPException(400, "Numero di telefono non valido")
     if not security.valid_code_format(body.code):
-        raise HTTPException(400, "Il codice deve essere di 6-10 cifre numeriche")
+        raise HTTPException(400, "Il codice deve essere di 4-10 cifre numeriche")
     token = security.new_api_token()
     with db.get_db() as conn:
         try:
             cur = conn.execute(
-                "INSERT INTO users (name, code_lookup, api_token_hash) VALUES (?,?,?)",
-                (body.name, security.code_lookup(body.code), security.hash_token(token)))
+                "INSERT INTO users (name, phone_lookup, code_hash, api_token_hash) VALUES (?,?,?,?)",
+                (body.name, security.phone_lookup(body.phone),
+                 security.code_hash(body.code), security.hash_token(token)))
         except Exception:
-            raise HTTPException(409, "Codice già in uso: scegline un altro")
+            raise HTTPException(409, "Questo numero è già registrato.")
         user_id = cur.lastrowid
         conn.execute("INSERT INTO devices (user_id) VALUES (?)", (user_id,))
     return {"user_id": user_id, "api_token": token,
@@ -130,6 +141,7 @@ def post_location(body: LocationIn, authorization: str | None = Header(default=N
         if body.event_id:
             conn.execute("UPDATE events SET status='located' WHERE id=? AND user_id=?",
                          (body.event_id, user_id))
+        purge_old_data(conn)   # retention: elimina dati oltre 30 giorni
     return {"ok": True}
 
 
@@ -144,6 +156,25 @@ def list_events(authorization: str | None = Header(default=None)):
     return {"events": [dict(r) for r in rows]}
 
 
+@app.delete("/v1/account")
+def delete_account(authorization: str | None = Header(default=None)):
+    """GDPR: cancella l'account e TUTTI i dati collegati (device, eventi,
+    posizioni). Richiesto anche da Apple (cancellazione account in-app)."""
+    with db.get_db() as conn:
+        user_id = auth_user(conn, authorization)
+        conn.execute("DELETE FROM locations WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM events WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM devices WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+    return {"deleted": True}
+
+
+def purge_old_data(conn) -> None:
+    """Data minimization: elimina posizioni ed eventi più vecchi di 30 giorni."""
+    conn.execute("DELETE FROM locations WHERE created_at < datetime('now','-30 days')")
+    conn.execute("DELETE FROM events WHERE created_at < datetime('now','-30 days')")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -156,19 +187,20 @@ def health():
 async def twilio_voice(request: Request, From: str = Form(default="")):
     form = dict((await request.form()).items())
     check_twilio_signature(request, form)
-    return twiml(gather_code(
-        "Benvenuto in Squillami. Inserisci il tuo codice di sblocco di sei cifre."))
+    return twiml(gather_phone(
+        "Benvenuto in MiChiami. Digita il numero del telefono da ritrovare, "
+        "seguito dal tasto cancelletto."))
 
 
-@app.post("/twilio/gather")
-async def twilio_gather(request: Request,
-                        Digits: str = Form(default=""),
-                        From: str = Form(default="")):
+@app.post("/twilio/identify")
+async def twilio_identify(request: Request,
+                          Digits: str = Form(default=""),
+                          From: str = Form(default="")):
+    """Passo 1: identifica l'utente dal numero digitato, poi chiede il codice."""
     form = dict((await request.form()).items())
     check_twilio_signature(request, form)
 
     with db.get_db() as conn:
-        # Rate limiting per numero chiamante
         window = (now() - timedelta(minutes=CALLER_WINDOW_MIN)).strftime("%Y-%m-%d %H:%M:%S")
         attempts = conn.execute(
             "SELECT COUNT(*) c FROM call_attempts WHERE caller=? AND success=0 AND created_at>?",
@@ -176,13 +208,41 @@ async def twilio_gather(request: Request,
         if attempts >= MAX_CALLER_ATTEMPTS:
             return twiml(say("Troppi tentativi da questo numero. Riprova più tardi.") + "<Hangup/>")
 
-        user = conn.execute("SELECT * FROM users WHERE code_lookup=?",
-                            (security.code_lookup(Digits),)).fetchone()
-
-        # Codice inesistente
+        user = conn.execute("SELECT * FROM users WHERE phone_lookup=?",
+                            (security.phone_lookup(Digits),)).fetchone()
         if user is None:
             conn.execute("INSERT INTO call_attempts (caller, success) VALUES (?,0)", (From,))
-            return twiml(gather_code("Codice non riconosciuto. Riprova."))
+            return twiml(gather_phone("Numero non riconosciuto. Riprova, "
+                                      "seguito dal tasto cancelletto."))
+
+    return twiml(gather_code("Numero riconosciuto. Ora digita il tuo codice di sblocco, "
+                             "seguito dal tasto cancelletto.", user["id"]))
+
+
+@app.post("/twilio/gather")
+async def twilio_gather(request: Request,
+                        uid: int,
+                        Digits: str = Form(default=""),
+                        From: str = Form(default="")):
+    """Passo 2: verifica il codice per l'utente già identificato dal numero."""
+    form = dict((await request.form()).items())
+    check_twilio_signature(request, form)
+
+    with db.get_db() as conn:
+        window = (now() - timedelta(minutes=CALLER_WINDOW_MIN)).strftime("%Y-%m-%d %H:%M:%S")
+        attempts = conn.execute(
+            "SELECT COUNT(*) c FROM call_attempts WHERE caller=? AND success=0 AND created_at>?",
+            (From, window)).fetchone()["c"]
+        if attempts >= MAX_CALLER_ATTEMPTS:
+            return twiml(say("Troppi tentativi da questo numero. Riprova più tardi.") + "<Hangup/>")
+
+        user = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+
+        # Codice errato per questo utente
+        if user is None or not security.verify_code(Digits, user["code_hash"]):
+            conn.execute("INSERT INTO call_attempts (caller, success) VALUES (?,0)", (From,))
+            return twiml(gather_code("Codice errato. Riprova, "
+                                     "seguito dal tasto cancelletto.", uid))
 
         # Account bloccato
         if user["locked_until"] and user["locked_until"] > now().strftime("%Y-%m-%d %H:%M:%S"):

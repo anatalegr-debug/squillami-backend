@@ -44,7 +44,7 @@ def send_ring_and_locate(push_token: str, platform: str, event_id: int,
             apns=messaging.APNSConfig(
                 headers={"apns-priority": "10"},
                 payload=messaging.APNSPayload(aps=messaging.Aps(
-                    alert=messaging.ApsAlert(title="Squillo richiesto"),
+                    alert=messaging.ApsAlert(title="MiChiami richiesto"),
                     sound=messaging.CriticalSound(name="alarm.caf",
                                                   critical=True, volume=1.0),
                 )),

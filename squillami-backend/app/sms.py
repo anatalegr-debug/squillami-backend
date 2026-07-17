@@ -20,7 +20,7 @@ SMS_FROM = os.environ.get("TWILIO_SMS_FROM", "")   # numero mittente Twilio
 
 def send_location(to: str, address: str, maps_url: str, when: str) -> bool:
     """Invia un SMS con l'ultima posizione nota. Ritorna True se inviato/simulato."""
-    body = (f"Squillami: il tuo telefono e' stato localizzato.\n"
+    body = (f"MiChiami: il tuo telefono e' stato localizzato.\n"
             f"{address}\n{maps_url}\n(rilevato: {when} UTC)")
 
     if not (ACCOUNT_SID and AUTH_TOKEN and SMS_FROM):

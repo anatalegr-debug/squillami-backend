@@ -16,7 +16,7 @@ def reverse(lat: float, lon: float, timeout: float = 5.0) -> str | None:
     try:
         url = ("https://nominatim.openstreetmap.org/reverse?format=jsonv2&" +
                urllib.parse.urlencode({"lat": lat, "lon": lon, "accept-language": "it"}))
-        req = urllib.request.Request(url, headers={"User-Agent": "SquillamiApp/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "MiChiamiApp/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.load(resp)
         return data.get("display_name")
