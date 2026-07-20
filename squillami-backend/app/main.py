@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape
 
 from fastapi import FastAPI, Form, Header, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from . import db, geocode, push, security, sms
@@ -16,6 +17,13 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("squillami")
 
 app = FastAPI(title="MiChiami", version="0.1.0")
+
+# CORS: la pagina web (altro dominio) deve poter chiamare /v1/ring e /v1/find.
+# La sicurezza è nel codice + CAPTCHA + lockout, non nell'origine.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=False,
+    allow_methods=["*"], allow_headers=["*"])
 
 
 @app.on_event("startup")
@@ -178,6 +186,103 @@ def purge_old_data(conn) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------
+# Canale WEB (priorità): fai squillare dal sito, con difese anti-abuso
+# --------------------------------------------------------------------------
+class RingIn(BaseModel):
+    phone: str
+    code: str
+    captcha_token: str = ""
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    return (fwd.split(",")[0].strip() if fwd else
+            (request.client.host if request.client else "?"))
+
+
+@app.post("/v1/ring")
+async def web_ring(body: RingIn, request: Request):
+    """Fai squillare il TUO telefono dal web. Difese: CAPTCHA, rate-limit per IP,
+    lockout per account, errore generico (niente enumerazione)."""
+    ip = _client_ip(request)
+    if not security.verify_captcha(body.captcha_token, ip):
+        raise HTTPException(400, "Verifica anti-bot non superata.")
+
+    with db.get_db() as conn:
+        window = (now() - timedelta(minutes=CALLER_WINDOW_MIN)).strftime("%Y-%m-%d %H:%M:%S")
+        ip_fails = conn.execute(
+            "SELECT COUNT(*) c FROM call_attempts WHERE caller=? AND success=0 AND created_at>?",
+            (f"web:{ip}", window)).fetchone()["c"]
+        if ip_fails >= MAX_CALLER_ATTEMPTS:
+            raise HTTPException(429, "Troppi tentativi da questa rete. Riprova più tardi.")
+
+        user = conn.execute("SELECT * FROM users WHERE phone_lookup=?",
+                            (security.phone_lookup(body.phone),)).fetchone()
+
+        def record_fail():
+            conn.execute("INSERT INTO call_attempts (caller, success) VALUES (?,0)", (f"web:{ip}",))
+
+        # Errore generico: non riveliamo se il numero è registrato
+        if user is None:
+            record_fail()
+            conn.commit()   # persisti il tentativo prima di uscire con errore
+            raise HTTPException(401, "Numero o codice non corretti.")
+
+        if user["locked_until"] and user["locked_until"] > now().strftime("%Y-%m-%d %H:%M:%S"):
+            raise HTTPException(423, "Account bloccato per troppi tentativi. Riprova tra qualche minuto.")
+
+        if not security.verify_code(body.code, user["code_hash"]):
+            fails = (user["failed_attempts"] or 0) + 1
+            if fails >= MAX_USER_FAILS:
+                lock_until = (now() + timedelta(minutes=LOCK_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+                conn.execute("UPDATE users SET failed_attempts=0, locked_until=? WHERE id=?",
+                             (lock_until, user["id"]))
+            else:
+                conn.execute("UPDATE users SET failed_attempts=? WHERE id=?", (fails, user["id"]))
+            record_fail()
+            conn.commit()   # persisti lockout/tentativo prima di uscire con errore
+            raise HTTPException(401, "Numero o codice non corretti.")
+
+        # Successo: azzera i tentativi, crea evento con token effimero, fai squillare
+        conn.execute("INSERT INTO call_attempts (caller, success) VALUES (?,1)", (f"web:{ip}",))
+        conn.execute("UPDATE users SET failed_attempts=0, locked_until=NULL WHERE id=?", (user["id"],))
+        find_token = security.new_find_token()
+        cur = conn.execute(
+            "INSERT INTO events (user_id, caller, status, find_token) VALUES (?,?, 'ringing', ?)",
+            (user["id"], f"web:{ip}", find_token))
+        event_id = cur.lastrowid
+        device = conn.execute("SELECT * FROM devices WHERE user_id=?", (user["id"],)).fetchone()
+        push.send_ring_and_locate((device["push_token"] if device else "") or "",
+                                  (device["platform"] if device else "ios") or "ios", event_id)
+
+    return {"ringing": True, "find_token": find_token}
+
+
+@app.get("/v1/find/{find_token}")
+def find_location(find_token: str):
+    """Legge la posizione per la sessione web. Scade dopo 10 minuti."""
+    with db.get_db() as conn:
+        ev = conn.execute("SELECT * FROM events WHERE find_token=?", (find_token,)).fetchone()
+        if ev is None:
+            raise HTTPException(404, "Sessione non trovata.")
+        expired = conn.execute(
+            "SELECT (created_at < datetime('now','-10 minutes')) AS e FROM events WHERE id=?",
+            (ev["id"],)).fetchone()["e"]
+        if expired:
+            raise HTTPException(410, "Sessione scaduta.")
+        loc = conn.execute("SELECT * FROM locations WHERE event_id=? ORDER BY id DESC LIMIT 1",
+                           (ev["id"],)).fetchone()
+        if loc is None:
+            loc = conn.execute("SELECT * FROM locations WHERE user_id=? ORDER BY id DESC LIMIT 1",
+                              (ev["user_id"],)).fetchone()
+        if loc is None:
+            return {"ready": False}
+    address = geocode.reverse(loc["lat"], loc["lon"])
+    return {"ready": True, "lat": loc["lat"], "lon": loc["lon"],
+            "address": address, "when": loc["created_at"], "kind": loc["kind"]}
 
 
 # --------------------------------------------------------------------------

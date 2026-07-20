@@ -29,8 +29,9 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id),
-    caller TEXT,                           -- numero di chi ha chiamato l'IVR
+    caller TEXT,                           -- chi ha avviato (numero IVR o web:IP)
     status TEXT DEFAULT 'pending',         -- pending | ringing | located | failed
+    find_token TEXT,                       -- token effimero per leggere la posizione via web
     created_at TEXT DEFAULT (datetime('now'))
 );
 

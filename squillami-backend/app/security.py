@@ -8,6 +8,7 @@ import secrets
 # Chiave segreta del server: OBBLIGATORIA in produzione (variabile d'ambiente SECRET_KEY)
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-change-me")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "")   # Cloudflare Turnstile (CAPTCHA)
 
 
 def code_hash(code: str) -> str:
@@ -31,6 +32,32 @@ def phone_lookup(raw: str) -> str:
 
 def new_api_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def new_find_token() -> str:
+    """Token effimero per la sessione web che legge la posizione."""
+    return secrets.token_urlsafe(24)
+
+
+def verify_captcha(token: str, remoteip: str | None = None) -> bool:
+    """Verifica il CAPTCHA (Cloudflare Turnstile). Se il secret non è
+    configurato (sviluppo) la verifica è disattivata e ritorna True."""
+    if not TURNSTILE_SECRET:
+        return True
+    try:  # pragma: no cover - richiede rete e secret reale
+        import urllib.parse
+        import urllib.request
+        data = {"secret": TURNSTILE_SECRET, "response": token or ""}
+        if remoteip:
+            data["remoteip"] = remoteip
+        req = urllib.request.Request(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data=urllib.parse.urlencode(data).encode())
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            import json
+            return bool(json.load(resp).get("success"))
+    except Exception:
+        return False
 
 
 def hash_token(token: str) -> str:
