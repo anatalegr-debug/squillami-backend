@@ -89,6 +89,7 @@ class RegisterIn(BaseModel):
     name: str = Field(default="", max_length=100)
     phone: str = Field(min_length=6, max_length=20)
     code: str = Field(min_length=4, max_length=10)
+    location_enabled: bool = True   # geolocalizzazione scelta già in fase di attivazione
 
 
 @app.post("/v1/register")
@@ -102,9 +103,11 @@ def register(body: RegisterIn):
     with db.get_db() as conn:
         try:
             cur = conn.execute(
-                "INSERT INTO users (name, phone_lookup, code_hash, api_token_hash) VALUES (?,?,?,?)",
+                "INSERT INTO users (name, phone_lookup, code_hash, api_token_hash, location_enabled) "
+                "VALUES (?,?,?,?,?)",
                 (body.name, security.phone_lookup(body.phone),
-                 security.code_hash(body.code), security.hash_token(token)))
+                 security.code_hash(body.code), security.hash_token(token),
+                 1 if body.location_enabled else 0))
         except Exception:
             raise HTTPException(409, "Questo numero è già registrato.")
         user_id = cur.lastrowid
