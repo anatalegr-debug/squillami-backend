@@ -212,7 +212,12 @@ def health():
 class RingIn(BaseModel):
     phone: str
     code: str
-    captcha_token: str = ""
+    # Proof-of-work self-hosted (anti-bot, nessun servizio esterno)
+    pow_seed: str = ""
+    pow_ts: int = 0
+    pow_bits: int = 0
+    pow_sig: str = ""
+    pow_nonce: str = ""
 
 
 def _client_ip(request: Request) -> str:
@@ -221,13 +226,33 @@ def _client_ip(request: Request) -> str:
             (request.client.host if request.client else "?"))
 
 
+@app.get("/v1/pow")
+async def get_pow():
+    """Emette una sfida proof-of-work firmata da risolvere prima di /v1/ring.
+    Pulisce anche le sfide già usate più vecchie di un'ora."""
+    with db.get_db() as conn:
+        old = (now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("DELETE FROM pow_used WHERE created_at < ?", (old,))
+        conn.commit()
+    return security.make_pow(int(now().timestamp()))
+
+
 @app.post("/v1/ring")
 async def web_ring(body: RingIn, request: Request):
-    """Fai squillare il TUO telefono dal web. Difese: CAPTCHA, rate-limit per IP,
+    """Fai squillare il TUO telefono dal web. Difese: proof-of-work, rate-limit per IP,
     lockout per account, errore generico (niente enumerazione)."""
     ip = _client_ip(request)
-    if not security.verify_captcha(body.captcha_token, ip):
+    if not security.verify_pow(body.pow_seed, body.pow_ts, body.pow_bits,
+                               body.pow_sig, body.pow_nonce, int(now().timestamp())):
         raise HTTPException(400, "Verifica anti-bot non superata.")
+    # Consuma la sfida (uso singolo) per impedire il replay dello stesso token
+    if security.POW_BITS > 0:
+        with db.get_db() as conn:
+            try:
+                conn.execute("INSERT INTO pow_used (seed) VALUES (?)", (body.pow_seed,))
+                conn.commit()
+            except Exception:
+                raise HTTPException(400, "Sfida anti-bot già usata. Riprova.")
 
     with db.get_db() as conn:
         window = (now() - timedelta(minutes=CALLER_WINDOW_MIN)).strftime("%Y-%m-%d %H:%M:%S")

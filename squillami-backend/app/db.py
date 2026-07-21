@@ -53,6 +53,11 @@ CREATE TABLE IF NOT EXISTS call_attempts (
     success INTEGER,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS pow_used (
+    seed TEXT PRIMARY KEY,                  -- sfida proof-of-work già consumata (uso singolo)
+    created_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 

@@ -8,7 +8,9 @@ import secrets
 # Chiave segreta del server: OBBLIGATORIA in produzione (variabile d'ambiente SECRET_KEY)
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-change-me")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "")   # Cloudflare Turnstile (CAPTCHA)
+TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "")   # Cloudflare Turnstile (CAPTCHA, opzionale)
+POW_BITS = int(os.environ.get("POW_BITS", "16"))            # difficoltà proof-of-work (multipli di 4). 0 = disattivata
+POW_TTL = int(os.environ.get("POW_TTL", "300"))            # secondi di validità di una sfida
 
 
 def code_hash(code: str) -> str:
@@ -58,6 +60,43 @@ def verify_captcha(token: str, remoteip: str | None = None) -> bool:
             return bool(json.load(resp).get("success"))
     except Exception:
         return False
+
+
+# --- Proof-of-work self-hosted (anti-bot senza servizi esterni) -------------
+# Il server emette una sfida firmata (HMAC, stateless). Il browser deve trovare
+# un nonce tale che sha256("seed.ts.bits.nonce") inizi con `bits/4` zeri esadecimali.
+# Costo per il client ~ 2^bits hash; per noi la verifica è un solo hash.
+
+def _pow_sig(seed: str, ts: int, bits: int) -> str:
+    return hmac.new(SECRET_KEY.encode(), f"{seed}.{int(ts)}.{bits}".encode(),
+                    hashlib.sha256).hexdigest()[:32]
+
+
+def make_pow(now_ts: int) -> dict:
+    """Crea una nuova sfida proof-of-work firmata."""
+    seed = secrets.token_hex(8)
+    return {"seed": seed, "ts": int(now_ts), "bits": POW_BITS,
+            "sig": _pow_sig(seed, now_ts, POW_BITS)}
+
+
+def verify_pow(seed: str, ts, bits, sig: str, nonce: str, now_ts: int) -> bool:
+    """Verifica una soluzione proof-of-work. Se POW_BITS<=0 la verifica è disattivata."""
+    if POW_BITS <= 0:
+        return True
+    try:
+        ts = int(ts); bits = int(bits)
+    except (TypeError, ValueError):
+        return False
+    if not seed or not sig:
+        return False
+    if not hmac.compare_digest(_pow_sig(seed, ts, bits), sig or ""):
+        return False          # sfida non emessa da noi o manomessa
+    if bits < POW_BITS:
+        return False          # difficoltà abbassata
+    if abs(now_ts - ts) > POW_TTL:
+        return False          # sfida scaduta
+    digest = hashlib.sha256(f"{seed}.{ts}.{bits}.{nonce}".encode()).hexdigest()
+    return digest.startswith("0" * (bits // 4))
 
 
 def hash_token(token: str) -> str:
