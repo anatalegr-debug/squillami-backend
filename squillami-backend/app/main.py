@@ -164,6 +164,24 @@ def list_events(authorization: str | None = Header(default=None)):
     return {"events": [dict(r) for r in rows]}
 
 
+class CodeIn(BaseModel):
+    code: str
+
+
+@app.patch("/v1/code")
+def change_code(body: CodeIn, authorization: str | None = Header(default=None)):
+    """Cambia il codice di sblocco dell'utente autenticato. Azzera anche
+    eventuali tentativi falliti / blocco."""
+    if not security.valid_code_format(body.code):
+        raise HTTPException(400, "Codice non valido (4-10 cifre).")
+    with db.get_db() as conn:
+        user_id = auth_user(conn, authorization)
+        conn.execute(
+            "UPDATE users SET code_hash=?, failed_attempts=0, locked_until=NULL WHERE id=?",
+            (security.code_hash(body.code), user_id))
+    return {"updated": True}
+
+
 @app.delete("/v1/account")
 def delete_account(authorization: str | None = Header(default=None)):
     """GDPR: cancella l'account e TUTTI i dati collegati (device, eventi,
