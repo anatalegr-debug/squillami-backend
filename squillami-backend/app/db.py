@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS users (
     api_token_hash TEXT NOT NULL,          -- hash del token usato dall'app
     failed_attempts INTEGER DEFAULT 0,
     locked_until TEXT,                     -- ISO datetime; account bloccato fino a
+    location_enabled INTEGER DEFAULT 1,    -- 1 = il telefono può essere geolocalizzato; 0 = solo squillo
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS events (
     caller TEXT,                           -- chi ha avviato (numero IVR o web:IP)
     status TEXT DEFAULT 'pending',         -- pending | ringing | located | failed
     find_token TEXT,                       -- token effimero per leggere la posizione via web
+    location_shared INTEGER DEFAULT 1,     -- snapshot: la posizione è condivisa per QUESTO evento
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -68,9 +70,19 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_column(conn, table: str, col: str, ddl: str) -> None:
+    """Aggiunge una colonna se manca (migrazione leggera per DB già esistenti)."""
+    existing = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+    if col not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        # Migrazioni per database creati con versioni precedenti dello schema
+        _ensure_column(conn, "users", "location_enabled", "location_enabled INTEGER DEFAULT 1")
+        _ensure_column(conn, "events", "location_shared", "location_shared INTEGER DEFAULT 1")
 
 
 @contextmanager

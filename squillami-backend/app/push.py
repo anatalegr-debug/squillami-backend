@@ -23,13 +23,14 @@ except Exception as exc:  # pragma: no cover
 
 
 def send_ring_and_locate(push_token: str, platform: str, event_id: int,
-                         ring_seconds: int = 120) -> bool:
-    """Invia la push RING_AND_LOCATE al dispositivo. Ritorna True se inviata."""
+                         ring_seconds: int = 120, locate: bool = True) -> bool:
+    """Invia la push RING_AND_LOCATE al dispositivo. Ritorna True se inviata.
+    `locate=False` -> il telefono squilla ma NON invia la posizione."""
     data = {
         "type": "RING_AND_LOCATE",
         "event_id": str(event_id),
         "ring_seconds": str(ring_seconds),
-        "locate": "true",
+        "locate": "true" if locate else "false",
     }
     if not _firebase_ready:
         log.info("PUSH SIMULATA -> token=%s platform=%s data=%s",

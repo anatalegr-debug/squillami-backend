@@ -182,6 +182,31 @@ def change_code(body: CodeIn, authorization: str | None = Header(default=None)):
     return {"updated": True}
 
 
+class SettingsIn(BaseModel):
+    location_enabled: bool
+
+
+@app.get("/v1/settings")
+def get_settings(authorization: str | None = Header(default=None)):
+    """Impostazioni dell'utente autenticato (per sincronizzare l'app)."""
+    with db.get_db() as conn:
+        user_id = auth_user(conn, authorization)
+        row = conn.execute("SELECT location_enabled FROM users WHERE id=?", (user_id,)).fetchone()
+    return {"location_enabled": bool(row["location_enabled"])}
+
+
+@app.patch("/v1/settings")
+def update_settings(body: SettingsIn, authorization: str | None = Header(default=None)):
+    """Attiva/disattiva la geolocalizzazione del telefono. Modificabile in
+    qualsiasi momento, anche a servizio attivo: se disattivata, il telefono
+    squilla comunque ma la posizione non viene condivisa."""
+    with db.get_db() as conn:
+        user_id = auth_user(conn, authorization)
+        conn.execute("UPDATE users SET location_enabled=? WHERE id=?",
+                     (1 if body.location_enabled else 0, user_id))
+    return {"location_enabled": body.location_enabled}
+
+
 @app.delete("/v1/account")
 def delete_account(authorization: str | None = Header(default=None)):
     """GDPR: cancella l'account e TUTTI i dati collegati (device, eventi,
@@ -290,18 +315,22 @@ async def web_ring(body: RingIn, request: Request):
             raise HTTPException(401, "Numero o codice non corretti.")
 
         # Successo: azzera i tentativi, crea evento con token effimero, fai squillare
+        share = 1 if user["location_enabled"] else 0
         conn.execute("INSERT INTO call_attempts (caller, success) VALUES (?,1)", (f"web:{ip}",))
         conn.execute("UPDATE users SET failed_attempts=0, locked_until=NULL WHERE id=?", (user["id"],))
         find_token = security.new_find_token()
         cur = conn.execute(
-            "INSERT INTO events (user_id, caller, status, find_token) VALUES (?,?, 'ringing', ?)",
-            (user["id"], f"web:{ip}", find_token))
+            "INSERT INTO events (user_id, caller, status, find_token, location_shared) "
+            "VALUES (?,?, 'ringing', ?, ?)",
+            (user["id"], f"web:{ip}", find_token, share))
         event_id = cur.lastrowid
         device = conn.execute("SELECT * FROM devices WHERE user_id=?", (user["id"],)).fetchone()
+        # Il telefono squilla sempre; la posizione viene rilevata solo se condivisa
         push.send_ring_and_locate((device["push_token"] if device else "") or "",
-                                  (device["platform"] if device else "ios") or "ios", event_id)
+                                  (device["platform"] if device else "ios") or "ios",
+                                  event_id, locate=bool(share))
 
-    return {"ringing": True, "find_token": find_token}
+    return {"ringing": True, "find_token": find_token, "location_shared": bool(share)}
 
 
 @app.get("/v1/find/{find_token}")
@@ -316,6 +345,9 @@ def find_location(find_token: str):
             (ev["id"],)).fetchone()["e"]
         if expired:
             raise HTTPException(410, "Sessione scaduta.")
+        # Geolocalizzazione disattivata per questo evento: squilla ma niente posizione
+        if not ev["location_shared"]:
+            return {"ready": False, "location_shared": False}
         loc = conn.execute("SELECT * FROM locations WHERE event_id=? ORDER BY id DESC LIMIT 1",
                            (ev["id"],)).fetchone()
         if loc is None:
@@ -401,20 +433,30 @@ async def twilio_gather(request: Request,
         conn.execute("UPDATE users SET failed_attempts=0, locked_until=NULL WHERE id=?",
                      (user["id"],))
 
-        # Crea evento e invia push
-        cur = conn.execute("INSERT INTO events (user_id, caller, status) VALUES (?,?, 'pending')",
-                           (user["id"], From))
+        # Crea evento e invia push (la posizione si rileva solo se condivisa)
+        share = 1 if user["location_enabled"] else 0
+        cur = conn.execute(
+            "INSERT INTO events (user_id, caller, status, location_shared) VALUES (?,?, 'pending', ?)",
+            (user["id"], From, share))
         event_id = cur.lastrowid
         device = conn.execute("SELECT * FROM devices WHERE user_id=?",
                               (user["id"],)).fetchone()
         sent = push.send_ring_and_locate(device["push_token"] or "",
-                                         device["platform"] or "android", event_id)
+                                         device["platform"] or "android", event_id,
+                                         locate=bool(share))
         conn.execute("UPDATE events SET status=? WHERE id=?",
                      ("ringing" if sent else "failed", event_id))
-        # Ultima posizione nota per l'SMS immediato
+        # Ultima posizione nota per l'SMS immediato (solo se la geolocalizzazione è attiva)
         last_loc = conn.execute(
             "SELECT * FROM locations WHERE user_id=? ORDER BY id DESC LIMIT 1",
-            (user["id"],)).fetchone()
+            (user["id"],)).fetchone() if share else None
+
+    # Geolocalizzazione disattivata: squilla ma non riveliamo la posizione
+    if not share:
+        return twiml(
+            say("Codice corretto. Sto facendo squillare il tuo telefono. "
+                "La geolocalizzazione è disattivata, quindi la posizione non viene "
+                "condivisa. Arrivederci.") + "<Hangup/>")
 
     # Invia subito un SMS con l'ultima posizione rilevata (se disponibile)
     if last_loc and From:
@@ -439,6 +481,11 @@ async def twilio_status(request: Request, event_id: int, try_: int | None = None
     attempt = int(request.query_params.get("try", "1"))
 
     with db.get_db() as conn:
+        ev = conn.execute("SELECT location_shared FROM events WHERE id=?", (event_id,)).fetchone()
+        if ev is not None and not ev["location_shared"]:
+            return twiml(say("Il telefono sta squillando. La geolocalizzazione è "
+                             "disattivata, quindi la posizione non viene condivisa. "
+                             "Arrivederci.") + "<Hangup/>")
         loc = conn.execute(
             "SELECT * FROM locations WHERE event_id=? ORDER BY id DESC LIMIT 1",
             (event_id,)).fetchone()
